@@ -29,6 +29,6 @@ def get_qwen_llm():
         repetition_penalty=1.15
     )
 
-    llm = HuggingFacePipeline(pipeline=pipe)
+    llm = HuggingFacePipeline(pipeline=pipe, pipeline_kwargs={"return_full_text": False})
     print("LLM initialization complete.")
     return llm
