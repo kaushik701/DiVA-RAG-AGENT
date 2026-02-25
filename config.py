@@ -6,7 +6,7 @@ DATA_DIR = os.path.join(BASE_DIR, "data")
 FAISS_INDEX_DIR = os.path.join(BASE_DIR, "faiss_index")
 
 # Data File
-JSON_FILE_PATH = os.path.join(DATA_DIR, "SoC-2026_Not_Final_Scrape_Version.json")
+JSON_FILE_PATH = os.path.join(DATA_DIR, "pdfs-converted_28_all_chapters.json")
 
 # Models
 # Using a standard embedding model for retrieval

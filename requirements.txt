@@ -9,3 +9,5 @@ transformers
 torch
 accelerate
 numpy
+fastapi
+uvicorn
