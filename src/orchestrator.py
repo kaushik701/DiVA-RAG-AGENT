@@ -1,153 +1,194 @@
 import json
 import logging
-import uuid
 from datetime import datetime
+from typing import Dict, Any, Tuple, Optional, List
+
+from src.models import OrchestratorRequest, AgentRequest, OrchestratorResponse, Citation, RoutingStructure
 from src.rag_agent import RAGAgent
 from src.fallback_agent import FallbackAgent
 
-# Configure logging to output structured observability data
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(message)s'
-)
+logging.basicConfig(level=logging.INFO, format='%(message)s')
 logger = logging.getLogger("Orchestrator")
 
 class Orchestrator:
     def __init__(self):
         print("Orchestrator: Initializing agent registry...")
-        # 1. Agent Registry: Defines agents and their routing rules.
-        # The orchestrator checks them in order. The first match is used.
         self.agent_registry = [
             {
                 "name": "SoC_RAG_Agent",
                 "agent": RAGAgent(),
                 "keywords": ["diabetes", "glucose", "insulin", "a1c", "patient", "hospital", "soc", "guideline", "surgery", "dka"],
+                "required_inputs": [],
                 "description": "Answers questions about the Diabetes Standards of Care."
             },
-            # The Fallback Agent should always be last, as it catches any query that wasn't routed.
+            # The Fallback Agent is always last.
             {
                 "name": "Fallback_Agent",
                 "agent": FallbackAgent(),
-                "keywords": [], # No keywords makes this the default/fallback agent
+                "keywords": [],
+                "required_inputs": [],
                 "description": "Handles queries that are out of scope."
             }
         ]
         print("Orchestrator: System Ready.")
 
-    def _route_query(self, query: str):
+    def process_request(self, request: OrchestratorRequest) -> OrchestratorResponse:
         """
-        Decides which agent to call by iterating through the agent registry.
-        The first agent whose keywords match the query is selected.
-        A fallback agent should be placed last with no keywords.
-        Returns: (agent_name, agent_instance, intent)
+        Main orchestration flow following the 9-step process.
         """
+        start_time = datetime.now()
+
+        # Step 2: Basic validation is handled by Pydantic in OrchestratorRequest.
+
+        # Step 3: Route the query to the appropriate agent.
+        agent_def, intent = self._route_query(request.question)
+
+        if not agent_def:
+            return self._create_error_response(request, "No suitable agent found for the query.")
+
+        # Step 4: Agent pre-check for required inputs.
+        pre_check_status, follow_up_questions = self._pre_check_agent(agent_def, request)
+        if pre_check_status == "needs_more_data":
+            response = OrchestratorResponse(
+                request_id=request.request_id,
+                agent_used=agent_def['name'],
+                status="needs_more_data",
+                answer="I need more information to answer your question.",
+                follow_ups=follow_up_questions
+            )
+            self._log_event(response.dict(), start_time)
+            return response
+
+        # Step 5: Call the selected agent with a standardized request.
+        try:
+            agent_request = AgentRequest(request_id=request.request_id, question=request.question, data=request.data)
+            raw_agent_response = agent_def['agent'].ask(agent_request)
+        except Exception as e:
+            return self._create_error_response(request, f"Agent execution failed: {str(e)}", agent_name=agent_def['name'])
+
+        # Step 6 & 7: Cleanup and normalize the raw agent response.
+        sanitized_response = self._sanitize_response(raw_agent_response, agent_def['name'])
+
+        # Step 8: Final packaging of the orchestrator's response.
+        final_response = self._package_response(request, agent_def['name'], sanitized_response, intent)
+
+        # Step 9: Log the final packaged response and return it.
+        self._log_event(final_response.dict(), start_time)
+        return final_response
+
+    def _route_query(self, query: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+        """Decides which agent to call based on keywords."""
         query_lower = query.lower()
-        
         for entry in self.agent_registry:
-            # An entry with no keywords is a default/fallback, so it matches if no other agent has.
             is_fallback = not entry["keywords"]
-            
-            # Find specific keyword match for intent detection
             matched_keyword = next((k for k in entry["keywords"] if k in query_lower), None)
 
             if matched_keyword:
-                return entry["name"], entry["agent"], f"intent_{matched_keyword}"
-            
+                return entry, f"intent_{matched_keyword}"
             if is_fallback:
-                return entry["name"], entry["agent"], "intent_out_of_scope"
-        
-        # This case should not be reached if a fallback agent is correctly configured.
-        return None, None, "unknown"
+                return entry, "intent_out_of_scope"
+        return None, None
 
-    def process_query(self, user_query: str):
-        """
-        Processes a query and returns a structured JSON response suitable for an API.
-        """
-        req_id = str(uuid.uuid4())
-        start_time = datetime.now()
-        
-        # 2. Routing
-        agent_name, selected_agent, intent = self._route_query(user_query)
-        
-        # Initialize Response Structure
-        response_payload = {
-            "req_id": req_id,
-            "query": user_query,
-            "agent_id": agent_name,
-            "status": "pending",
-            "timestamp": start_time.isoformat(),
-            "time_taken_ms": 0,
-            "answer": "",
-            "routing_structure": {
-                "confidence_score": 0.0,
-                "intent": intent,
-                "context": "medical_guidelines" if agent_name == "SoC_RAG_Agent" else "general",
-                "grades": []
-            }
-        }
+    def _pre_check_agent(self, agent_def: Dict[str, Any], request: OrchestratorRequest) -> Tuple[str, List[str]]:
+        """Checks if the agent has all the required inputs."""
+        missing_inputs = [req for req in agent_def.get("required_inputs", []) if req not in request.data or not request.data[req]]
+        if missing_inputs:
+            follow_ups = [f"Could you please provide your {inp.replace('_', ' ')}?"]
+            return "needs_more_data", follow_ups
+        return "ok", []
 
-        if not selected_agent:
-            response_payload["status"] = "failed"
-            response_payload["answer"] = "No suitable agent found."
-            self._log_event(response_payload)
-            return response_payload
+    def _sanitize_response(self, raw_response: Dict[str, Any], agent_name: str) -> Dict[str, Any]:
+        """Enforces schema, cleans up data, and performs safety checks."""
+        sanitized = {}
+        result_text = raw_response.get("result", "I'm sorry, I could not find an answer.")
+        source_docs = raw_response.get("source_documents", [])
 
-        # 3. Execution
-        try:
-            # Call the selected agent
-            response = selected_agent.ask(user_query)
-            
-            # Calculate timing
-            duration = (datetime.now() - start_time).total_seconds() * 1000
-            response_payload["time_taken_ms"] = round(duration, 2)
-
-            # 4. Observability & Metadata Extraction
-            result_text = response.get("result", "")
-            source_docs = response.get("source_documents", [])
-            
-            # Extract Grades, Rec IDs, and Sources from metadata
-            grades = list(set([doc.metadata.get("grade") for doc in source_docs if doc.metadata.get("grade")]))
-            rec_ids = list(set([doc.metadata.get("rec_id") for doc in source_docs if doc.metadata.get("rec_id")]))
-            sources = list(set([doc.metadata.get("title") for doc in source_docs if doc.metadata.get("title")]))
-            
-            # Determine success (Heuristic: did the model say "I don't know"?)
-            # Check first 50 chars for refusal to avoid false negatives from hallucinations at the end
+        # Safety post-check (f)
+        if "you should take" in result_text.lower() or "i recommend you take" in result_text.lower():
+            result_text = "I found some information that might be relevant, but I cannot provide medical advice or dosing instructions. Please consult with your healthcare provider."
+            sanitized['status'] = "safety_override"
+        else:
             is_success = "don't know" not in result_text.lower()[:50] and len(source_docs) > 0
+            if agent_name == "Fallback_Agent": is_success = True
+            sanitized['status'] = "success" if is_success else "miss"
+
+        sanitized['answer'] = result_text
+
+        # Filter citations (d) and remove internal fields (e)
+        unique_citations = {}
+        sanitized['results'] = []
+        for doc in source_docs:
+            source = doc.metadata.get("title", "Unknown Source")
+            rec_id = doc.metadata.get("rec_id")
+            grade = doc.metadata.get("grade")
+            key = (source, rec_id)
+            if key not in unique_citations:
+                unique_citations[key] = Citation(source=source, rec_id=rec_id, grade=grade)
             
-            # Calculate a pseudo-confidence score based on retrieval success
-            confidence = 0.95 if is_success else 0.1
-            if not source_docs and agent_name == "SoC_RAG_Agent":
-                confidence = 0.0
+            sanitized['results'].append({"content": doc.page_content}) # Only include content
 
-            response_payload["status"] = "success" if is_success else "miss"
-            response_payload["answer"] = result_text
-            
-            # Update Routing Structure
-            response_payload["routing_structure"].update({
-                "confidence_score": confidence,
-                "grades": grades,
-                "rec_ids": rec_ids,
-                "sources": sources,
-                "source_count": len(source_docs)
-            })
-            
-            self._log_event(response_payload)
-            return response_payload
+        sanitized['citations'] = list(unique_citations.values())
+        sanitized['follow_ups'] = raw_response.get("follow_ups", []) # Fix missing pieces (b)
 
-        except Exception as e:
-            response_payload["status"] = "error"
-            response_payload["answer"] = "An internal error occurred."
-            response_payload["error_details"] = str(e)
-            self._log_event(response_payload)
-            return response_payload
+        return sanitized
 
-    def run(self, user_query: str):
-        """
-        Legacy wrapper for CLI usage. Returns just the answer string.
-        """
-        result = self.process_query(user_query)
-        return result["answer"]
+    def _package_response(self, request: OrchestratorRequest, agent_name: str, sanitized: Dict[str, Any], intent: str) -> OrchestratorResponse:
+        """Assembles the final OrchestratorResponse object."""
+        # Calculate confidence score
+        confidence = 0.0
+        if sanitized['status'] == 'success': confidence = 0.95
+        elif sanitized['status'] == 'miss': confidence = 0.4
+        elif sanitized['status'] == 'safety_override': confidence = 0.8 # Confident it found something, but had to override
 
-    def _log_event(self, payload):
-        """Logs the structured event to console (or file in future)."""
-        logger.info(f"\n[OBSERVABILITY LOG]\n{json.dumps(payload, indent=2)}\n")
+        # Extract metadata for routing structure
+        citations = sanitized.get('citations', [])
+        grades = list(set([c.grade for c in citations if c.grade]))
+        rec_ids = list(set([c.rec_id for c in citations if c.rec_id]))
+        sources = list(set([c.source for c in citations]))
+
+        routing_structure = RoutingStructure(
+            confidence_score=confidence,
+            intent=intent,
+            context="medical_guidelines" if agent_name == "SoC_RAG_Agent" else "general",
+            grades=grades,
+            rec_ids=rec_ids,
+            sources=sources,
+            source_count=len(sanitized.get('results', []))
+        )
+
+        return OrchestratorResponse(
+            request_id=request.request_id,
+            agent_used=agent_name,
+            status=sanitized['status'],
+            answer=sanitized['answer'],
+            results=sanitized['results'],
+            citations=sanitized['citations'],
+            follow_ups=sanitized['follow_ups'],
+            routing_structure=routing_structure
+        )
+
+    def _create_error_response(self, request: OrchestratorRequest, error_msg: str, agent_name: Optional[str] = None) -> OrchestratorResponse:
+        """Creates a standardized error response."""
+        response = OrchestratorResponse(
+            request_id=request.request_id,
+            agent_used=agent_name,
+            status="error",
+            answer="An internal error occurred while processing your request.",
+            error_details=error_msg
+        )
+        self._log_event(response.dict(), datetime.now())
+        return response
+
+    def _log_event(self, payload: Dict[str, Any], start_time: datetime):
+        """Logs the structured event, including timing."""
+        duration = (datetime.now() - start_time).total_seconds() * 1000
+        log_payload = payload.copy()
+        log_payload['timestamp'] = start_time.isoformat()
+        log_payload['time_taken_ms'] = round(duration, 2)
+        logger.info(f"\n[OBSERVABILITY LOG]\n{json.dumps(log_payload, indent=2, default=str)}\n")
+
+    def run(self, user_query: str) -> str:
+        """Legacy wrapper for CLI usage. Returns just the answer string."""
+        request = OrchestratorRequest(question=user_query)
+        result = self.process_request(request)
+        return result.answer
